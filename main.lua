@@ -1,6 +1,6 @@
 --[[--
 @module koplugin.wallabag2
---]]
+]]
 
 -- wallabag2 - for Wallabag 2.4+ (or compatible) API servers
 -- clach04
@@ -37,7 +37,7 @@ local socketutil = require("socketutil")
 local util = require("util")
 local _ = require("gettext")
 local T = FFIUtil.template
-local AsyncDownloader = require("plugins/2wallabag.koplugin/asyncdownloader")
+local Downloader = require("lib.downloader")
 
 -- constants
 local article_id_prefix = "[w-id_"
@@ -55,7 +55,6 @@ function Wallabag2:onDispatcherRegisterActions()
 end
 
 function Wallabag2:init()
-    self.downloader = AsyncDownloader:new()
     self.token_expiry = 0
     -- default values so that user doesn't have to explicitely set them
     self.is_delete_finished = true
@@ -572,6 +571,61 @@ function Wallabag2:filterIgnoredTags(article_list)
     return filtered_list
 end
 
+--- Download Wallabag2 article.
+-- @string article
+-- @treturn int 1 failed, 2 skipped, 3 downloaded
+function Wallabag2:download(article)
+    local skip_article = false
+    local title = util.getSafeFilename(article.title, self.directory, 230, 0)
+    local file_ext = ".epub"
+    local item_url = "/api/entries/" .. article.id .. "/export.epub"
+
+    -- If the article links to a supported file, we will download it directly.
+    -- All webpages are HTML. Ignore them since we want the Wallabag2 EPUB instead!
+    if article.mimetype ~= "text/html" then
+        if DocumentRegistry:hasProvider(nil, article.mimetype) then
+            file_ext = "."..DocumentRegistry:mimeToExt(article.mimetype)
+            item_url = article.url
+        -- A function represents `null` in our JSON.decode, because `nil` would just disappear.
+        -- In that case, fall back to the file extension.
+        elseif type(article.mimetype) == "function" and DocumentRegistry:hasProvider(article.url) then
+            file_ext = ""
+            item_url = article.url
+        end
+    end
+
+    local local_path = self.directory .. article_id_prefix .. article.id .. article_id_postfix .. title .. file_ext
+    logger.dbg("Wallabag2: DOWNLOAD: id: ", article.id)
+    logger.dbg("Wallabag2: DOWNLOAD: title: ", article.title)
+    logger.dbg("Wallabag2: DOWNLOAD: filename: ", local_path)
+
+    local attr = lfs.attributes(local_path)
+    if attr then
+        -- File already exists, skip it. Preferably only skip if the date of local file is newer than server's.
+        -- newsdownloader.koplugin has a date parser but it is available only if the plugin is activated.
+        --- @todo find a better solution
+        if self.is_dateparser_available then
+            local server_date = self.dateparser.parse(article.updated_at)
+            if server_date < attr.modification then
+                skip_article = true
+                logger.dbg("Wallabag2: skipping file (date checked): ", local_path)
+            end
+        else
+            skip_article = true
+            logger.dbg("Wallabag2: skipping file: ", local_path)
+        end
+    end
+
+    if skip_article == false then
+        if self:callAPI("GET", item_url, nil, "", local_path) then
+            return downloaded
+        else
+            return failed
+        end
+    end
+    return skipped
+end
+
 -- method: (mandatory) GET, POST, DELETE, PATCH, etc...
 -- apiurl: (mandatory) API call excluding the server path, or full URL to a file
 -- headers: defaults to auth if given nil value, provide all headers necessary if in use
@@ -702,19 +756,41 @@ function Wallabag2:synchronize()
 
             local total_articles = #articles
             local downloaded_count = 0
+            local failed_count = 0
+
             local progress_bar = InfoMessage:new{
-                text = T(_("Downloading articles (%1/%2)"), downloaded_count, total_articles),
+                text = T(_("Downloading articles (%1/%2)"), 0, total_articles),
                 timeout = 0, -- Persist until closed
             }
             UIManager:show(progress_bar)
 
-            self.downloader.on_complete = function()
-                downloaded_count = downloaded_count + 1
-                progress_bar:setText(T(_("Downloading articles (%1/%2)"), downloaded_count, total_articles))
-                if downloaded_count == total_articles then
+            local downloader = Downloader:new{
+                wallabag_instance = self,
+                on_progress = function(success)
+                    if success then
+                        downloaded_count = downloaded_count + 1
+                    else
+                        failed_count = failed_count + 1
+                    end
+                    local processed_count = downloaded_count + failed_count
+                    progress_bar:setText(T(_("Downloading articles (%1/%2)"), processed_count, total_articles))
+                end,
+                on_complete = function()
                     UIManager:close(progress_bar)
-                end
-            end
+                    -- synchronize remote deletions after downloads are complete
+                    deleted_count = deleted_count + self:processRemoteDeletes(remote_article_ids)
+
+                    local msg
+                    if failed_count > 0 then
+                        msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2\nFailed: %3")
+                        info = InfoMessage:new{ text = T(msg, downloaded_count, deleted_count, failed_count) }
+                    else
+                        msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2")
+                        info = InfoMessage:new{ text = T(msg, downloaded_count, deleted_count) }
+                    end
+                    UIManager:show(info)
+                end,
+            }
 
             for _, article in ipairs(articles) do
                 logger.dbg("Wallabag2: queueing article ID: ", article.id)
@@ -723,22 +799,12 @@ function Wallabag2:synchronize()
                 local file_ext = ".epub"
                 local item_url = self.server_url .. "/api/entries/" .. article.id .. "/export.epub"
                 local local_path = self.directory .. article_id_prefix .. article.id .. article_id_postfix .. title .. file_ext
-                self.downloader:add_to_queue(item_url, local_path)
-            end
-            self.downloader:start()
 
-            -- synchronize remote deletions
-            deleted_count = deleted_count + self:processRemoteDeletes(remote_article_ids)
-
-            local msg
-            if failed_count ~= 0 then
-                msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2\nFailed: %3")
-                info = InfoMessage:new{ text = T(msg, downloaded_count, deleted_count, failed_count) }
-            else
-                msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2")
-                info = InfoMessage:new{ text = T(msg, downloaded_count, deleted_count) }
+                if not lfs.attributes(local_path) then
+                    downloader:add_to_queue(item_url, local_path)
+                end
             end
-            UIManager:show(info)
+            downloader:start()
         end -- articles
     end -- access_token
 end
@@ -1041,11 +1107,11 @@ Restart KOReader after editing the config file.]]), BD.dirpath(DataStorage:getSe
                     text = _("Apply"),
                     callback = function()
                         local myfields = self.settings_dialog:getFields()
-                        self.server_url    = myfields:gsub("/*$", "")  -- remove all trailing "/" slashes
-                        self.client_id     = myfields
-                        self.client_secret = myfields
-                        self.username      = myfields
-                        self.password      = myfields
+                        self.server_url    = myfields[1]:gsub("/*$", "")  -- remove all trailing "/" slashes
+                        self.client_id     = myfields[2]
+                        self.client_secret = myfields[3]
+                        self.username      = myfields[4]
+                        self.password      = myfields[5]
                         self:saveSettings()
                         UIManager:close(self.settings_dialog)
                     end
@@ -1081,7 +1147,7 @@ function Wallabag2:editClientSettings()
                     text = _("Apply"),
                     callback = function()
                         local myfields = self.client_settings_dialog:getFields()
-                        self.articles_per_sync = math.max(1, tonumber(myfields) or self.articles_per_sync)
+                        self.articles_per_sync = math.max(1, tonumber(myfields[1]) or self.articles_per_sync)
                         self:saveSettings(myfields)
                         UIManager:close(self.client_settings_dialog)
                     end
