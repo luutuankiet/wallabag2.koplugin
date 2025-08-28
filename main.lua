@@ -110,6 +110,7 @@ function Wallabag2:init()
     end
     self.remove_finished_from_history = self.wb_settings.data.wallabag.remove_finished_from_history or false
     self.download_queue = self.wb_settings.data.wallabag.download_queue or {}
+    self.last_sync_timestamp = self.wb_settings.data.wallabag.last_sync_timestamp
 
     -- workaround for dateparser only available if newsdownloader is active
     self.is_dateparser_available = false
@@ -471,6 +472,9 @@ function Wallabag2:getArticleList()
     if self.filter_tag ~= "" then
         filtering = "&tags=" .. self.filter_tag
     end
+    if self.last_sync_timestamp then
+        filtering = filtering .. "&since=" .. self.last_sync_timestamp
+    end
 
     local article_list = {}
     local page = 1
@@ -741,6 +745,8 @@ function Wallabag2:synchronize()
             UIManager:show(info)
         end -- articles
     end -- access_token
+    self.last_sync_timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    self:saveSettings()
 end
 
 function Wallabag2:processRemoteDeletes(remote_article_ids)
@@ -1108,6 +1114,7 @@ end
 
 function Wallabag2:saveSettings()
     local tempsettings = {
+        last_sync_timestamp   = self.last_sync_timestamp,
         server_url            = self.server_url,
         client_id             = self.client_id,
         client_secret         = self.client_secret,

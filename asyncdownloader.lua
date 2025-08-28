@@ -10,7 +10,7 @@ local coctx = require("common.turbo.coctx")
 local co = coroutine
 
 local AsyncDownloader = {
-    max_concurrent_downloads = 5, -- Adjust as needed
+    max_concurrent_downloads = 10, -- Adjust as needed
     download_queue = {},
     active_downloads = 0,
     on_complete = nil,
