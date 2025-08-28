@@ -37,7 +37,7 @@ local socketutil = require("socketutil")
 local util = require("util")
 local _ = require("gettext")
 local T = FFIUtil.template
-local AsyncDownloader = require("plugins/2wallabag.koplugin/asyncdownloader")
+local AsyncDownloader = require("lib.asyncdownloader")
 
 -- constants
 local article_id_prefix = "[w-id_"
@@ -55,7 +55,12 @@ function Wallabag2:onDispatcherRegisterActions()
 end
 
 function Wallabag2:init()
-    self.downloader = AsyncDownloader:new()
+    self.downloader = AsyncDownloader:new({
+        on_complete = function()
+            self:onDownloadComplete()
+        end,
+        wallabag_instance = self,
+    })
     self.token_expiry = 0
     -- default values so that user doesn't have to explicitely set them
     self.is_delete_finished = true
@@ -472,6 +477,7 @@ function Wallabag2:getArticleList()
     if self.filter_tag ~= "" then
         filtering = "&tags=" .. self.filter_tag
     end
+
     if self.last_sync_timestamp then
         filtering = filtering .. "&since=" .. self.last_sync_timestamp
     end
@@ -584,7 +590,10 @@ end
 -- @treturn result or (nil, "network_error") or (nil, "json_error")
 -- or (nil, "http_error", code)
 ---- @todo separate call to internal API from the download on external server
-function Wallabag2:callAPI(method, apiurl, headers, body, filepath, quiet)
+function Wallabag2:callAPI(method, apiurl, headers, body, filepath, quiet, is_async)
+    if is_async then
+        return self:_callAPI_async(method, apiurl, headers, body, filepath, quiet)
+    end
     local sink = {}
     local request = {}
 
@@ -704,49 +713,48 @@ function Wallabag2:synchronize()
         if articles then
             logger.dbg("Wallabag2: number of articles:", #articles)
 
-            local total_articles = #articles
-            local downloaded_count = 0
-            local progress_bar = InfoMessage:new{
-                text = T(_("Downloading articles (%1/%2)"), downloaded_count, total_articles),
+            self.downloaded_count = 0
+            self.deleted_count = deleted_count
+            self.progress_bar = InfoMessage:new{
+                text = T(_("Downloading articles (%1/%2)"), 0, #articles),
                 timeout = 0, -- Persist until closed
             }
-            UIManager:show(progress_bar)
-
-            self.downloader.on_complete = function()
-                downloaded_count = downloaded_count + 1
-                progress_bar:setText(T(_("Downloading articles (%1/%2)"), downloaded_count, total_articles))
-                if downloaded_count == total_articles then
-                    UIManager:close(progress_bar)
-                end
-            end
+            UIManager:show(self.progress_bar)
 
             for _, article in ipairs(articles) do
                 logger.dbg("Wallabag2: queueing article ID: ", article.id)
                 remote_article_ids[ tostring(article.id) ] = true
+
                 local title = util.getSafeFilename(article.title, self.directory, 230, 0)
                 local file_ext = ".epub"
                 local item_url = self.server_url .. "/api/entries/" .. article.id .. "/export.epub"
                 local local_path = self.directory .. article_id_prefix .. article.id .. article_id_postfix .. title .. file_ext
-                self.downloader:add_to_queue(item_url, local_path)
+
+                local attr = lfs.attributes(local_path)
+                if not attr then
+                    self.downloader:add_to_queue(item_url, local_path)
+                end
             end
             self.downloader:start()
-
             -- synchronize remote deletions
-            deleted_count = deleted_count + self:processRemoteDeletes(remote_article_ids)
-
-            local msg
-            if failed_count ~= 0 then
-                msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2\nFailed: %3")
-                info = InfoMessage:new{ text = T(msg, downloaded_count, deleted_count, failed_count) }
-            else
-                msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2")
-                info = InfoMessage:new{ text = T(msg, downloaded_count, deleted_count) }
-            end
-            UIManager:show(info)
+            self.deleted_count = self.deleted_count + self:processRemoteDeletes(remote_article_ids)
         end -- articles
     end -- access_token
     self.last_sync_timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
     self:saveSettings()
+end
+
+function Wallabag2:onDownloadComplete()
+    self.downloaded_count = self.downloaded_count + 1
+    local total = #self.downloader.download_queue + self.downloaded_count
+    self.progress_bar:setText(T(_("Downloading articles (%1/%2)"), self.downloaded_count, total))
+
+    if self.downloaded_count == total then
+        UIManager:close(self.progress_bar)
+        local msg = _("Processing finished.\n\nArticles downloaded: %1\nDeleted: %2")
+        local info = InfoMessage:new{ text = T(msg, self.downloaded_count, self.deleted_count) }
+        UIManager:show(info)
+    end
 end
 
 function Wallabag2:processRemoteDeletes(remote_article_ids)
@@ -1047,11 +1055,11 @@ Restart KOReader after editing the config file.]]), BD.dirpath(DataStorage:getSe
                     text = _("Apply"),
                     callback = function()
                         local myfields = self.settings_dialog:getFields()
-                        self.server_url    = myfields:gsub("/*$", "")  -- remove all trailing "/" slashes
-                        self.client_id     = myfields
-                        self.client_secret = myfields
-                        self.username      = myfields
-                        self.password      = myfields
+                        self.server_url    = myfields[1]:gsub("/*$", "")  -- remove all trailing "/" slashes
+                        self.client_id     = myfields[2]
+                        self.client_secret = myfields[3]
+                        self.username      = myfields[4]
+                        self.password      = myfields[5]
                         self:saveSettings()
                         UIManager:close(self.settings_dialog)
                     end
@@ -1087,8 +1095,8 @@ function Wallabag2:editClientSettings()
                     text = _("Apply"),
                     callback = function()
                         local myfields = self.client_settings_dialog:getFields()
-                        self.articles_per_sync = math.max(1, tonumber(myfields) or self.articles_per_sync)
-                        self:saveSettings(myfields)
+                        self.articles_per_sync = math.max(1, tonumber(myfields[1]) or self.articles_per_sync)
+                        self:saveSettings()
                         UIManager:close(self.client_settings_dialog)
                     end
                 },
@@ -1114,7 +1122,6 @@ end
 
 function Wallabag2:saveSettings()
     local tempsettings = {
-        last_sync_timestamp   = self.last_sync_timestamp,
         server_url            = self.server_url,
         client_id             = self.client_id,
         client_secret         = self.client_secret,
@@ -1134,6 +1141,7 @@ function Wallabag2:saveSettings()
         remove_finished_from_history = self.remove_finished_from_history,
         remove_read_from_history = self.remove_read_from_history,
         download_queue        = self.download_queue,
+        last_sync_timestamp   = self.last_sync_timestamp,
     }
     self.wb_settings:saveSetting("wallabag", tempsettings)
     self.wb_settings:flush()
@@ -1241,6 +1249,66 @@ function Wallabag2:onToggleFilterTag()
         timeout = 1,
      })
 end
+
+function Wallabag2:_callAPI_async(method, apiurl, headers, body, filepath, quiet)
+    local async_socket = require("common.turbo.socket_ffi")
+    local ioloop = require("common.turbo.ioloop")
+    local coctx = require("common.turbo.coctx")
+    local ffi = require("ffi")
+
+    local url_parts = self.downloader:_parse_url(apiurl)
+    if not url_parts then
+        logger.err("Wallabag2: invalid url: ", apiurl)
+        return false
+    end
+
+    local ip = self.downloader:_resolve_host(url_parts.host)
+    if not ip then
+        logger.err("Wallabag2: could not resolve host: ", url_parts.host)
+        return false
+    end
+
+    local fd, err = async_socket.new_nonblock_socket()
+    if fd == -1 then
+        logger.err("Wallabag2: could not create socket: ", err)
+        return false
+    end
+
+    local ok, err = self.downloader:_connect(fd, ip, url_parts.port)
+    if not ok then
+        logger.err("Wallabag2: could not connect: ", err)
+        ffi.C.close(fd)
+        return false
+    end
+
+    local request_headers = "GET " .. url_parts.path .. " HTTP/1.1\r\n" ..
+                        "Host: " .. url_parts.host .. "\r\n" ..
+                        "Connection: close\r\n\r\n"
+
+    ok, err = self.downloader:_send(fd, request_headers)
+    if not ok then
+        logger.err("Wallabag2: could not send request: ", err)
+        ffi.C.close(fd)
+        return false
+    end
+
+    local file, err = io.open(filepath, "w")
+    if not file then
+        logger.err("Wallabag2: could not open destination file: ", err)
+        ffi.C.close(fd)
+        return false
+    end
+
+    ok, err = self.downloader:_receive(fd, file)
+    if not ok then
+        logger.err("Wallabag2: could not receive response: ", err)
+    end
+
+    file:close()
+    ffi.C.close(fd)
+    return true
+end
+
 
 -- require("mobdebug").start()
 return Wallabag2
